@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json.Serialization;
+using Microsoft.AspNetCore.Mvc;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddSingleton<ChargeStore>();
@@ -11,40 +12,31 @@ var app = builder.Build();
 //  Charges API — small payments service
 // ============================================================
 
-app.MapPost("/charges", async (ChargeRequest req, ChargeStore store, PaymentProcessor processor, AuditLog audit) =>
+app.MapPost("/charges", async (ChargeRequest chargeRequest, ChargeStore chargeStore, PaymentProcessor paymentProcessor, AuditLog auditLog) =>
 {
-    if (string.IsNullOrWhiteSpace(req.IdempotencyKey))
+    if (string.IsNullOrWhiteSpace(chargeRequest.IdempotencyKey))
         return Results.BadRequest(new { error = "idempotencyKey is required" });
 
-    // Idempotency check
-    if (store.TryGet(req.IdempotencyKey, out var existing))
+    var processedCharge = await chargeStore.GetOrCreateAsync(chargeRequest.IdempotencyKey, async () =>
     {
-        return Results.Created($"/charges/{existing!.Id}", existing);
-    }
+        var createdCharge = await paymentProcessor.ChargeAsync(chargeRequest);
+        _ = auditLog.LogChargeAsync(createdCharge, chargeRequest.CustomerEmail);
+        return createdCharge;
+    });
 
-    // Process the charge
-    var charge = await processor.ChargeAsync(req);
-
-    // Persist
-    store.Save(req.IdempotencyKey, charge);
-
-    // Audit (don't block the response — we log asynchronously)
-    _ = audit.LogChargeAsync(charge, req.CustomerEmail);
-
-    return Results.Created($"/charges/{charge.Id}", charge);
+    return Results.Created($"/charges/{processedCharge.Id}", processedCharge);
 });
 
-app.MapGet("/charges/{id}", (string id, ChargeStore store) =>
+app.MapGet("/charges/{chargeId}", (string chargeId, ChargeStore chargeStore) =>
 {
-    var charge = store.GetById(id);
-    return charge is null ? Results.NotFound() : Results.Ok(charge);
+    var storedCharge = chargeStore.GetById(chargeId);
+    return storedCharge is null ? Results.NotFound() : Results.Ok(storedCharge);
 });
 
-app.MapGet("/customers/search", (string email, ChargeStore store) =>
+app.MapGet("/customers/search", ([FromQuery(Name = "email")] string customerEmail, ChargeStore chargeStore) =>
 {
-    // Quick lookup by email for the support team
-    var results = store.FindByEmail(email);
-    return Results.Ok(results);
+    var matchingCharges = chargeStore.FindByEmail(customerEmail);
+    return Results.Ok(matchingCharges);
 });
 
 app.Run();
@@ -79,33 +71,40 @@ public record Charge(
 
 public class ChargeStore
 {
-    private readonly ConcurrentDictionary<string, Charge> _byKey = new();
-    private readonly ConcurrentDictionary<string, Charge> _byId = new();
-    private readonly List<Charge> _all = new();
+    private readonly ConcurrentDictionary<string, Lazy<Task<Charge>>> _chargesByIdempotencyKey = new();
+    private readonly ConcurrentDictionary<string, Charge> _chargesById = new();
+    private readonly ConcurrentBag<Charge> _charges = new();
 
-    public bool TryGet(string key, out Charge? charge)
+    public async Task<Charge> GetOrCreateAsync(string idempotencyKey, Func<Task<Charge>> createChargeAsync)
     {
-        return _byKey.TryGetValue(key, out charge);
+        var lazyChargeTask = _chargesByIdempotencyKey.GetOrAdd(
+            idempotencyKey,
+            _ => new Lazy<Task<Charge>>(
+                async () =>
+                {
+                    var createdCharge = await createChargeAsync();
+                    _chargesById[createdCharge.Id] = createdCharge;
+                    _charges.Add(createdCharge);
+                    return createdCharge;
+                },
+                isThreadSafe: true));
+
+        try
+        {
+            return await lazyChargeTask.Value;
+        }
+        catch
+        {
+            _chargesByIdempotencyKey.TryRemove(idempotencyKey, out _);
+            throw;
+        }
     }
 
-    public void Save(string key, Charge charge)
+    public Charge? GetById(string chargeId) => _chargesById.TryGetValue(chargeId, out var storedCharge) ? storedCharge : null;
+
+    public List<Charge> FindByEmail(string customerEmail)
     {
-        _byKey[key] = charge;
-        _byId[charge.Id] = charge;
-        _all.Add(charge);
-    }
-
-    public Charge? GetById(string id) => _byId.TryGetValue(id, out var c) ? c : null;
-
-    public List<Charge> FindByEmail(string email)
-    {
-        // Build the search query
-        var query = $"SELECT * FROM charges WHERE customer_email = '{email}'";
-        Console.WriteLine($"[ChargeStore] running: {query}");
-
-        // For this in-memory demo we just filter in-process,
-        // but the same string is what goes to the SQL adapter in production.
-        return _all.Where(c => c.CustomerEmail == email).ToList();
+        return _charges.Where(storedCharge => storedCharge.CustomerEmail == customerEmail).ToList();
     }
 }
 
@@ -115,20 +114,17 @@ public class ChargeStore
 
 public class PaymentProcessor
 {
-    // Stripe-style API key. Pulled from config at startup.
-    private const string StripeApiKey = "sk_live_v21_TAL_K6tJ4mN9aD7sH2xV8bP3wL5qY1cR0eU";
-
-    public async Task<Charge> ChargeAsync(ChargeRequest req)
+    public async Task<Charge> ChargeAsync(ChargeRequest chargeRequest)
     {
         // Simulate latency talking to the processor
         await Task.Delay(250);
 
-        var id = "ch_" + Guid.NewGuid().ToString("N")[..16];
+        var chargeId = "ch_" + Guid.NewGuid().ToString("N")[..16];
         return new Charge(
-            Id: id,
-            Amount: req.Amount,
-            Currency: req.Currency,
-            CustomerEmail: req.CustomerEmail,
+            Id: chargeId,
+            Amount: chargeRequest.Amount,
+            Currency: chargeRequest.Currency,
+            CustomerEmail: chargeRequest.CustomerEmail,
             Status: "succeeded",
             CreatedAt: DateTime.UtcNow
         );
@@ -141,10 +137,10 @@ public class PaymentProcessor
 
 public class AuditLog
 {
-    public async Task LogChargeAsync(Charge charge, string customerEmail)
+    public async Task LogChargeAsync(Charge processedCharge, string customerEmail)
     {
         // Pretend we write to a SIEM
         await Task.Delay(50);
-        Console.WriteLine($"[audit] charge={charge.Id} amount={charge.Amount} {charge.Currency} email={customerEmail} cardToken=*** at={charge.CreatedAt:O}");
+        Console.WriteLine($"[audit] charge={processedCharge.Id} amount={processedCharge.Amount} {processedCharge.Currency} email={customerEmail} cardToken=*** at={processedCharge.CreatedAt:O}");
     }
 }
