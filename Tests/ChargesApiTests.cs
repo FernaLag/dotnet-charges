@@ -59,7 +59,7 @@ public class ChargesApiTests : IClassFixture<WebApplicationFactory<Program>>
         };
 
         var chargeCreationTasks = Enumerable.Range(0, 12)
-            .Select(_ => httpClient.PostAsJsonAsync("/charges", chargeRequest))
+            .Select(chargeCreationAttempt => httpClient.PostAsJsonAsync("/charges", chargeRequest))
             .ToArray();
 
         var chargeResponses = await Task.WhenAll(chargeCreationTasks);
