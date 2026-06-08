@@ -11,15 +11,20 @@ var app = builder.Build();
 
 app.MapPost("/charges", async (ChargeRequest chargeRequest, ChargeStore chargeStore, PaymentProcessor paymentProcessor, AuditLog auditLog) =>
 {
-    if (string.IsNullOrWhiteSpace(chargeRequest.IdempotencyKey))
-        return Results.BadRequest(new { error = "idempotencyKey is required" });
+    var chargeValidationResult = ChargeRequestValidator.Validate(chargeRequest);
+    if (!chargeValidationResult.IsValid)
+        return Results.BadRequest(new { error = chargeValidationResult.ErrorMessage });
 
-    var processedCharge = await chargeStore.GetOrCreateAsync(chargeRequest.IdempotencyKey, async () =>
+    var chargeRequestFingerprint = ChargeRequestFingerprint.Create(chargeRequest);
+    var chargeStoreResult = await chargeStore.GetOrCreateAsync(chargeRequest.IdempotencyKey, chargeRequestFingerprint, async () =>
     {
-        var createdCharge = await paymentProcessor.ChargeAsync(chargeRequest);
+        var createdCharge = await paymentProcessor.ChargeAsync(chargeRequest, chargeRequest.IdempotencyKey);
         _ = auditLog.LogChargeAsync(createdCharge, chargeRequest.CustomerEmail);
         return createdCharge;
     });
+
+    if (chargeStoreResult.HasIdempotencyConflict || chargeStoreResult.Charge is not Charge processedCharge)
+        return Results.Conflict(new { error = "idempotencyKey was already used with different request data" });
 
     return Results.Created($"/charges/{processedCharge.Id}", processedCharge);
 });

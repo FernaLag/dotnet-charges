@@ -4,8 +4,10 @@ namespace ChargesApi.Services;
 
 public class PaymentProcessor
 {
-    public async Task<Charge> ChargeAsync(ChargeRequest chargeRequest)
+    public async Task<Charge> ChargeAsync(ChargeRequest chargeRequest, string idempotencyKey)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(idempotencyKey);
+
         await Task.Delay(250);
 
         var chargeId = "ch_" + Guid.NewGuid().ToString("N")[..16];

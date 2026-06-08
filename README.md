@@ -1,6 +1,6 @@
 # Charges API
 
-Small payments service. Exposes `POST /charges` (idempotent), `GET /charges/{id}`, and `GET /customers/search?email=`.
+Small payments service. Exposes `POST /charges`, `GET /charges/{id}`, and `GET /customers/search?email=`.
 
 ## Run
 
@@ -8,7 +8,11 @@ Small payments service. Exposes `POST /charges` (idempotent), `GET /charges/{id}
 dotnet run
 ```
 
-The API listens on `http://localhost:5000` (or whatever ASP.NET defaults to).
+The API listens on `http://localhost:5000` when started with that URL.
+
+```bash
+dotnet run --urls http://localhost:5000
+```
 
 ## Quick smoke test
 
@@ -18,10 +22,10 @@ curl -X POST http://localhost:5000/charges \
   -d '{"idempotencyKey":"k1","amount":12.50,"currency":"USD","customerEmail":"a@b.com","cardToken":"tok_visa"}'
 ```
 
-## What's known broken
+## Behavior
 
-Customers are reporting two issues:
-1. Some are seeing duplicate charges for the same purchase.
-2. Our security team flagged something on this endpoint in their last review.
+`POST /charges` requires `idempotencyKey`, positive `amount`, `currency`, `customerEmail`, and `cardToken`.
 
-There may be more. Find what you can.
+Repeated requests with the same `idempotencyKey` return the same charge when the request data is the same. Reusing the same `idempotencyKey` with different request data returns `409 Conflict`.
+
+Data is stored in memory, so charges and idempotency records are lost when the process stops.
